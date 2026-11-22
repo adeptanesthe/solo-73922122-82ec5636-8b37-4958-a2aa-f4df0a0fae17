@@ -4,6 +4,11 @@
     GET  /health  健康检查
     POST /repair  上传原图(8 位灰度 PNG)、二值掩膜 PNG 与端点对 JSON，
                   返回补线结果与（可能被修改后的）掩膜 PNG（base64）。
+
+`/repair` 增加可选的流式响应：表单字段 `stream=true` 时返回 NDJSON
+（每行一个 JSON 事件），其余表单字段与原请求完全相同。事件顺序为
+`preview`（可多条，指定端点对的补线判定）在前、`result`（与普通请求
+等价的整图结果）在后；无解时只发一条 `result`（无解 + 原掩膜）。
 """
 
 from __future__ import annotations
@@ -11,16 +16,20 @@ from __future__ import annotations
 import base64
 import io
 import json
+from typing import Iterable
 
 from fastapi import FastAPI, File, Form, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from PIL import Image
 
 from .solver import (
     MAX_SIDE,
     RepairError,
+    SolveResult,
     apply_cells_to_mask,
+    prepare_repair,
     solve,
+    stream_prepared,
     validate_pair_inputs,
 )
 
@@ -83,6 +92,108 @@ def _mask_to_png(mask: list[bytearray], width: int, height: int) -> bytes:
     return io_buf.getvalue()
 
 
+def _result_payload(
+    result: SolveResult,
+    mask: list[bytearray],
+    width: int,
+    height: int,
+) -> dict:
+    """把求解结果整理成响应体（普通请求与流式 result 事件共用）。
+
+    无解时返回原掩膜与原因；有解时写回确定补线的像素。
+    """
+    if not result.feasible:
+        png_bytes = _mask_to_png(mask, width, height)
+        return {
+            "status": "no_solution",
+            "message": "无法同时接通全部端点对，返回原掩膜",
+            "reason": result.reason,
+            "mask_png_base64": base64.b64encode(png_bytes).decode("ascii"),
+        }
+
+    out_mask = [bytearray(row) for row in mask]
+    apply_cells_to_mask(out_mask, [(x, y) for x, y in result.applied_cells])
+    png_bytes = _mask_to_png(out_mask, width, height)
+    applied_set = {tuple(p) for p in result.applied_cells}
+    return {
+        "status": "ok",
+        "image_size": [width, height],
+        "min_total_cost": result.min_total_cost,
+        "applied_pair_count": result.decisions.count("apply"),
+        "review_pair_count": result.decisions.count("review"),
+        "pairs": result.pair_details,
+        "applied_cells": sorted(applied_set),
+        "mask_png_base64": base64.b64encode(png_bytes).decode("ascii"),
+    }
+
+
+def _parse_stream_flag(raw: str | None) -> bool:
+    if raw is None:
+        return False
+    value = raw.strip().lower()
+    if value in ("", "false", "0", "no"):
+        return False
+    if value in ("true", "1", "yes"):
+        return True
+    raise RepairError("stream 只能是 true/false")
+
+
+def _parse_preview_pairs(raw: str | None, pair_count: int) -> list[int]:
+    """解析要先看的端点对编号（1 基，与响应中的 pair_id 一致）。
+
+    接受 ``"1,3"`` 或 JSON 数组 ``[1,3]``；顺序即预览顺序，重复编号只保留首次。
+    """
+    if raw is None or not raw.strip():
+        raise RepairError("stream=true 时必须提供 preview_pairs，指明要先看的端点对编号")
+    text = raw.strip()
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RepairError("preview_pairs 不是合法 JSON 数组") from exc
+        if not isinstance(parsed, list):
+            raise RepairError("preview_pairs 必须是编号数组")
+        values = parsed
+    else:
+        values = [part for part in text.replace("，", ",").split(",") if part.strip()]
+
+    ids: list[int] = []
+    for value in values:
+        try:
+            pair_id = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RepairError("preview_pairs 中的编号必须是整数") from exc
+        if not (1 <= pair_id <= pair_count):
+            raise RepairError(f"preview_pairs 中的编号 {pair_id} 超出端点对范围 1..{pair_count}")
+        if pair_id not in ids:
+            ids.append(pair_id)
+    if not ids:
+        raise RepairError("preview_pairs 至少需要一个端点对编号")
+    return ids
+
+
+def _ndjson(events: Iterable[dict]):
+    for event in events:
+        yield json.dumps(event, ensure_ascii=False) + "\n"
+
+
+def stream_repair_events(
+    prep,
+    preview_pair_ids: list[int],
+    mask: list[bytearray],
+    width: int,
+    height: int,
+    *,
+    trace=None,
+) -> Iterable[dict]:
+    """把求解事件转成 NDJSON 事件体（惰性：消费一条才算一条）。"""
+    for kind, payload in stream_prepared(prep, preview_pair_ids, trace=trace):
+        if kind == "preview":
+            yield {"event": "preview", **payload}
+        else:
+            yield {"event": "result", **_result_payload(payload, mask, width, height)}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -98,6 +209,14 @@ async def repair(
             "JSON 数组，至多 8 对端点。元素形如 "
             '{"a":[x1,y1],"b":[x2,y2],"region":[x0,y0,x1,y1](可选, 边长<=24)}'
         ),
+    ),
+    stream: str | None = Form(
+        None,
+        description="true 时返回 NDJSON 流式响应（先 preview 后 result）",
+    ),
+    preview_pairs: str | None = Form(
+        None,
+        description='要先看补线判定的端点对编号（1 基），如 "1,3" 或 "[1,3]"',
     ),
 ):
     try:
@@ -115,36 +234,27 @@ async def repair(
             raise RepairError("pairs 必须是 JSON 数组")
 
         specs = validate_pair_inputs(pair_payload, w1, h1)
-        result = solve(specs, mask, gray, w1, h1)
+        streaming = _parse_stream_flag(stream)
+        preview_ids = (
+            _parse_preview_pairs(preview_pairs, len(specs)) if streaming else []
+        )
 
-        if not result.feasible:
-            # 无法同时接通：返回原掩膜与无解提示
-            png_bytes = _mask_to_png(mask, w1, h1)
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "no_solution",
-                    "message": "无法同时接通全部端点对，返回原掩膜",
-                    "reason": result.reason,
-                    "mask_png_base64": base64.b64encode(png_bytes).decode("ascii"),
-                },
-            )
+        if not streaming:
+            result = solve(specs, mask, gray, w1, h1)
+            return JSONResponse(status_code=200, content=_result_payload(
+                result, mask, w1, h1
+            ))
 
-        applied = [(x, y) for x, y in result.applied_cells]
-        out_mask = [bytearray(row) for row in mask]
-        apply_cells_to_mask(out_mask, applied)
-        png_bytes = _mask_to_png(out_mask, w1, h1)
+        # 流式：准备阶段（候选枚举/冲突图）先同步完成，输入错误仍能返回 400；
+        # 之后的事件按“存在性确认 -> 预览 -> 独立组最优 -> 整图结果”产出。
+        prep = prepare_repair(specs, mask, gray, w1, h1)
 
-        applied_set = {tuple(p) for p in result.applied_cells}
-        return {
-            "status": "ok",
-            "image_size": [w1, h1],
-            "min_total_cost": result.min_total_cost,
-            "applied_pair_count": result.decisions.count("apply"),
-            "review_pair_count": result.decisions.count("review"),
-            "pairs": result.pair_details,
-            "applied_cells": sorted(applied_set),
-            "mask_png_base64": base64.b64encode(png_bytes).decode("ascii"),
-        }
+        return StreamingResponse(
+            _ndjson(stream_repair_events(
+                prep, [i - 1 for i in preview_ids], mask, w1, h1
+            )),
+            media_type="application/x-ndjson",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
     except RepairError as exc:
         return JSONResponse(status_code=400, content={"status": "error", "message": str(exc)})

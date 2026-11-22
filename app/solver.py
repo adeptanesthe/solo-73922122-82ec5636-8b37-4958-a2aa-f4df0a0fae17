@@ -12,6 +12,13 @@
 * 目标：在能同时接通全部端点对的方案中，使新增像素的原图灰度总和最小。
 * 只补在所有最低代价方案中路径一致的端点对，其余列为待复核。
 * 若无法同时接通，返回无解（由上层返回原掩膜与无解提示）。
+
+求解流程拆成三步，普通请求与流式请求共用：
+
+1. ``prepare_repair``：校验端点、枚举候选、构建跨对冲突与连通分量；
+2. ``solve``：直接算完全部分量，返回与历史版本一致的 ``SolveResult``；
+3. ``stream_repair``：先确认所有分量可同时接通，再只算预览对所在分量，
+   发出预览事件后才计算与预览对无（直接/间接）候选冲突的分量。
 """
 
 from __future__ import annotations
@@ -315,20 +322,34 @@ def validate_pair_inputs(
     return specs
 
 
-def solve(
+@dataclass
+class PreparedRepair:
+    """共用准备阶段的结果：候选与互不影响的连通分量（冲突组）。"""
+
+    specs: list[PairSpec]
+    components: list[list[int]]
+
+
+def prepare_repair(
     specs: list[PairSpec],
     mask: list[bytearray],
     gray: list[bytes] | list[bytearray],
     width: int,
     height: int,
-) -> SolveResult:
-    """按全部约束求最低代价补线方案，并判定每对是否路径一致。"""
+) -> PreparedRepair | SolveResult:
+    """枚举候选、构建跨对冲突图并拆分连通分量。
+
+    若某对端点本身无合法候选，返回不可行的 ``SolveResult``；
+    否则返回 ``PreparedRepair``，供 ``solve`` / ``stream_repair`` 复用。
+    """
     # 1) 逐对枚举并校验候选路径
     for spec in specs:
         if not mask[spec.a[1]][spec.a[0]] or not mask[spec.b[1]][spec.b[0]]:
             raise RepairError(
                 f"第 {spec.pair_id + 1} 对端点必须位于原走线（掩膜前景）上"
             )
+        # 允许同一 specs 被重复求解（普通请求 / 流式 / 测试对拍）
+        spec.candidates = []
         region = (spec.x0, spec.y0, spec.x1, spec.y1)
         for path in enumerate_paths(spec.a, spec.b, *region):
             cand = _build_candidate(
@@ -345,7 +366,9 @@ def solve(
     n = len(specs)
 
     # 2) 跨对冲突：重叠或四邻接即不兼容（双向检查）
-    conflicts: list[list[list[int]]] = [[[] for _ in s.candidates] for s in specs]
+    conflicts: list[list[list[tuple[int, int]]]] = [
+        [[] for _ in s.candidates] for s in specs
+    ]
     for i in range(n):
         for j in range(i + 1, n):
             si, sj = specs[i], specs[j]
@@ -383,81 +406,117 @@ def solve(
                     stack.append(j)
         components.append(sorted(members))
 
+    return PreparedRepair(specs=specs, components=components)
+
+
+def _component_order(specs: list[PairSpec], members: list[int]) -> list[int]:
+    """分量内的求解顺序：候选少的先试，稳定排序。"""
+    return sorted(members, key=lambda k: len(specs[k].candidates))
+
+
+def _search(
+    specs: list[PairSpec],
+    members: list[int],
+    fixed: tuple[int, int] | None = None,
+    *,
+    need_optimum: bool = True,
+) -> int | None:
+    """在单个连通分量内做记忆化搜索。
+
+    * ``need_optimum=True``：返回最低可行代价，无解返回 ``None``；
+    * ``need_optimum=False``：只确认存在可行组合，存在即返回 0（可提前结束）。
+
+    ``fixed`` 为 ``(pair_id, cand_idx)`` 时强制该对选择指定候选；
+    若它不在该分量内则忽略（调用方保证不这样用）。
+    """
+    order = _component_order(specs, members)
+    comp_size = len(order)
+
+    def dfs(
+        pos: int,
+        occ_cells: frozenset,
+        occ_forbid: frozenset,
+        memo: dict,
+    ):
+        if pos == comp_size:
+            return 0
+        key = (pos, occ_cells, occ_forbid)
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
+        pair_id = order[pos]
+        cands = specs[pair_id].candidates
+        forced = fixed[1] if fixed is not None and fixed[0] == pair_id else None
+        best = None
+        for ci, cand in enumerate(cands):
+            if forced is not None and ci != forced:
+                continue
+            # 双向冲突：重叠或四邻接（任一侧进入对方禁占区）
+            if (cand.cellset & occ_cells) or (cand.cellset & occ_forbid) \
+                    or (cand.forbid & occ_cells):
+                continue
+            sub = dfs(
+                pos + 1,
+                occ_cells | cand.cellset,
+                occ_forbid | cand.forbid,
+                memo,
+            )
+            if sub is None:
+                continue
+            if not need_optimum:
+                # 只确认可同时接通：找到第一条可行组合即可
+                memo[key] = 0
+                return 0
+            value = cand.cost + sub
+            if best is None or value < best:
+                best = value
+        memo[key] = best
+        return best
+
+    return dfs(0, frozenset(), frozenset(), {})
+
+
+def _component_infeasible(members: list[int]) -> SolveResult:
+    names = "、".join(str(k + 1) for k in members)
+    return SolveResult(
+        feasible=False,
+        reason=f"第 {names} 对之间存在无法同时满足的冲突，无全局可行方案",
+    )
+
+
+def _supported_candidates(
+    specs: list[PairSpec],
+    members: list[int],
+    pair_id: int,
+    comp_min: int,
+) -> list[Candidate]:
+    """求该对在分量全部最低代价方案中出现过的路径（按路径去重）。"""
+    supported: list[Candidate] = []
+    for ci, cand in enumerate(specs[pair_id].candidates):
+        cond_value = _search(specs, members, (pair_id, ci))
+        if cond_value == comp_min:
+            supported.append(cand)
+    uniq: dict[frozenset, Candidate] = {}
+    for cand in supported:
+        uniq.setdefault(cand.cellset, cand)
+    return list(uniq.values())
+
+
+def _assemble(
+    prep: PreparedRepair,
+    supported_by_pair: dict[int, list[Candidate]],
+    total_cost: int,
+) -> SolveResult:
+    """把每对的全部最低代价路径整理成最终结果（与历史响应结构一致）。"""
+    n = len(prep.specs)
     decisions = ["review"] * n
     alternatives: list[list[Candidate]] = [[] for _ in range(n)]
     pair_details: list[dict | None] = [None] * n
     applied_cells: list[list[int]] = []
-    total_cost = 0
 
-    # 4) 每个连通分量独立做记忆化搜索求全局最低代价
-    for members in components:
-        order = sorted(members, key=lambda k: len(specs[k].candidates))
-        comp_size = len(order)
-
-        def dfs(pos: int, occ_cells: frozenset, occ_forbid: frozenset,
-                fixed: tuple, memo: dict):
-            """返回从 pos 起的最低可行代价；无解返回 None。
-
-            fixed 为 () 或强制选择 (pair_id, cand_idx)。
-            记忆化键即全部入参；返回值与到达路径无关，可安全缓存。
-            规模上限（8 对、每对 <=46 候选、区内 <=24x24）下朴素记忆化足够快。
-            """
-            if pos == comp_size:
-                return 0
-            key = (pos, occ_cells, occ_forbid, fixed)
-            cached = memo.get(key)
-            if cached is not None:
-                return cached
-            pair_id = order[pos]
-            cands = specs[pair_id].candidates
-            forced = fixed[1] if fixed and fixed[0] == pair_id else None
-            best = None
-            for ci, cand in enumerate(cands):
-                if forced is not None and ci != forced:
-                    continue
-                # 双向冲突：重叠或四邻接（任一侧进入对方禁占区）
-                if (cand.cellset & occ_cells) or (cand.cellset & occ_forbid) \
-                        or (cand.forbid & occ_cells):
-                    continue
-                sub = dfs(
-                    pos + 1,
-                    occ_cells | cand.cellset,
-                    occ_forbid | cand.forbid,
-                    fixed,
-                    memo,
-                )
-                if sub is None:
-                    continue
-                value = cand.cost + sub
-                if best is None or value < best:
-                    best = value
-            memo[key] = best
-            return best
-
-        comp_min = dfs(0, frozenset(), frozenset(), (), {})
-        if comp_min is None:
-            names = "、".join(str(k + 1) for k in members)
-            return SolveResult(
-                feasible=False,
-                reason=f"第 {names} 对之间存在无法同时满足的冲突，无全局可行方案",
-            )
-        total_cost += comp_min
-
-        # 5) 判定路径一致性：固定每对的每个候选求条件最优。
-        #    条件最优仍等于分量最优 => 该候选出现在某个最低代价方案中。
-        for pair_id in order:
-            supported: list[Candidate] = []
-            for ci, cand in enumerate(specs[pair_id].candidates):
-                cond_value = dfs(
-                    0, frozenset(), frozenset(), (pair_id, ci), {}
-                )
-                if cond_value == comp_min:
-                    supported.append(cand)
-            # 同路径（同新增像素集合）只保留一条用于展示
-            uniq: dict[frozenset, Candidate] = {}
-            for cand in supported:
-                uniq.setdefault(cand.cellset, cand)
-            supported = list(uniq.values())
+    for members in prep.components:
+        for pair_id in _component_order(prep.specs, members):
+            supported = supported_by_pair[pair_id]
             alternatives[pair_id] = supported
             if len(supported) == 1:
                 decisions[pair_id] = "apply"
@@ -491,6 +550,179 @@ def solve(
         pair_details=[d for d in pair_details if d is not None],
         alternatives=alternatives,
     )
+
+
+def solve(
+    specs: list[PairSpec],
+    mask: list[bytearray],
+    gray: list[bytes] | list[bytearray],
+    width: int,
+    height: int,
+) -> SolveResult:
+    """按全部约束求最低代价补线方案，并判定每对是否路径一致。"""
+    prep = prepare_repair(specs, mask, gray, width, height)
+    if isinstance(prep, SolveResult):
+        return prep
+
+    supported_by_pair: dict[int, list[Candidate]] = {}
+    total_cost = 0
+
+    # 每个连通分量独立做记忆化搜索求全局最低代价
+    for members in prep.components:
+        comp_min = _search(prep.specs, members)
+        if comp_min is None:
+            return _component_infeasible(members)
+        total_cost += comp_min
+
+        # 判定路径一致性：固定每对的每个候选求条件最优。
+        # 条件最优仍等于分量最优 => 该候选出现在某个最低代价方案中。
+        for pair_id in members:
+            supported_by_pair[pair_id] = _supported_candidates(
+                prep.specs, members, pair_id, comp_min
+            )
+
+    return _assemble(prep, supported_by_pair, total_cost)
+
+
+# 流式事件类型：("preview", 载荷) 或 ("result", SolveResult)
+StreamEvent = tuple[str, dict | SolveResult]
+
+
+def stream_repair(
+    specs: list[PairSpec],
+    mask: list[bytearray],
+    gray: list[bytes] | list[bytearray],
+    width: int,
+    height: int,
+    preview_pair_ids: list[int],
+    *,
+    trace=None,
+) -> Iterable[StreamEvent]:
+    """流式求解入口：先做共用准备阶段，再交由 ``stream_prepared`` 产出事件。"""
+    prep = prepare_repair(specs, mask, gray, width, height)
+    yield from stream_prepared(prep, preview_pair_ids, trace=trace)
+
+
+def stream_prepared(
+    prep: PreparedRepair | SolveResult,
+    preview_pair_ids: list[int],
+    *,
+    trace=None,
+) -> Iterable[StreamEvent]:
+    """流式求解：先确认全局可接通，再发预览对的判定，最后发整图结果。
+
+    参数 ``preview_pair_ids`` 为 0 基的端点对编号，按给定顺序预览。
+    ``trace`` 仅为测试/观测钩子，形如 ``trace(phase, detail)``。
+
+    事件顺序：
+    1. 先对**全部**连通分量做一次存在性搜索（不算最优），确认所有端点对
+       能同时接通；任一分量不可行则只发一个 ``result``（无解 + 原掩膜，
+       不发预览）。
+    2. 按请求顺序发 ``preview``：先求该对所在分量（同一分量只算一次）并
+       列出该对在所有最低总代价方案中的路径；只有一条时才判 ``apply``。
+       排在最前的预览对最先求、最先发，其余预览对各自算出后立即发出。
+    3. 与预览对没有直接/间接候选冲突的分量（即不含预览对的分量）
+       在预览发出后才求最优。
+    4. 发 ``result``，内容与普通请求等价。
+    """
+    if isinstance(prep, SolveResult):
+        yield ("result", prep)
+        return
+
+    n_pairs = len(prep.specs)
+    if not preview_pair_ids:
+        raise RepairError("流式请求至少需要一个预览端点对")
+    for pair_id in preview_pair_ids:
+        if not (0 <= pair_id < n_pairs):
+            raise RepairError(f"预览端点对编号 {pair_id + 1} 超出范围 1..{n_pairs}")
+
+    def emit(phase: str, **detail) -> None:
+        if trace is not None:
+            trace(phase, detail)
+
+    comp_of: dict[int, int] = {}
+    for cid, members in enumerate(prep.components):
+        for pair_id in members:
+            comp_of[pair_id] = cid
+
+    # 1) 先确认全部端点对能同时接通（存在性搜索，不是最优）
+    for cid, members in enumerate(prep.components):
+        feasible = _search(
+            prep.specs, members, need_optimum=False
+        )
+        emit("feasibility_checked", component=cid, members=members,
+             feasible=feasible is not None)
+        if feasible is None:
+            yield ("result", _component_infeasible(members))
+            return
+
+    # 2) 只求与预览对直接/间接冲突的分量（含预览对的分量），按请求顺序预览。
+    #    同一分量只算一次；该分量内的其它预览对随分量一起算出，随后立刻预览。
+    supported_by_pair: dict[int, list[Candidate]] = {}
+    comp_min: dict[int, int] = {}
+    solved_cids: set[int] = set()
+
+    def solve_component(cid: int) -> None:
+        if cid in solved_cids:
+            return
+        members = prep.components[cid]
+        value = _search(prep.specs, members)
+        assert value is not None  # 上一步已确认可行
+        comp_min[cid] = value
+        for pair_id in members:
+            supported_by_pair[pair_id] = _supported_candidates(
+                prep.specs, members, pair_id, value
+            )
+        solved_cids.add(cid)
+        emit("preview_component_solved", component=cid, members=members,
+             min_cost=value)
+
+    def preview_event(pair_id: int) -> dict:
+        supported = supported_by_pair[pair_id]
+        decision = "apply" if len(supported) == 1 else "review"
+        return {
+            "pair_id": pair_id + 1,
+            "decision": decision,
+            "path_count": len(supported),
+            "component_min_cost": comp_min[comp_of[pair_id]],
+            "paths": [
+                {"turns": c.turns, "cost": c.cost, "new_cells": c.as_payload()}
+                for c in supported
+            ],
+        }
+
+    # 先预览请求里排在最前的那个分量；其余预览分量等到首个预览发出后
+    # （仍早于整图结果）；每个预览对一算出就立刻发出。
+    emitted: set[int] = set()
+    if preview_pair_ids:
+        solve_component(comp_of[preview_pair_ids[0]])
+    for pair_id in preview_pair_ids:
+        solve_component(comp_of[pair_id])
+        if pair_id in emitted:
+            continue
+        emitted.add(pair_id)
+        supported = supported_by_pair[pair_id]
+        emit("preview", pair_id=pair_id,
+             decision="apply" if len(supported) == 1 else "review",
+             path_count=len(supported))
+        yield ("preview", preview_event(pair_id))
+
+    # 3) 预览之后才求与预览对无冲突的端点组最优
+    for cid, members in enumerate(prep.components):
+        if cid in solved_cids:
+            continue
+        value = _search(prep.specs, members)
+        assert value is not None  # 上一步已确认可行
+        comp_min[cid] = value
+        for pair_id in members:
+            supported_by_pair[pair_id] = _supported_candidates(
+                prep.specs, members, pair_id, value
+            )
+        emit("deferred_component_solved", component=cid, members=members,
+             min_cost=value)
+
+    total_cost = sum(comp_min.values())
+    yield ("result", _assemble(prep, supported_by_pair, total_cost))
 
 
 def apply_cells_to_mask(

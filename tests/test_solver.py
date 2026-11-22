@@ -8,6 +8,7 @@ from app.solver import (
     RepairError,
     enumerate_paths,
     solve,
+    stream_repair,
     validate_pair_inputs,
 )
 
@@ -350,3 +351,194 @@ def test_default_region_is_square_and_contains_endpoints():
     assert width <= MAX_REGION_SIDE
     assert s.x0 <= 3 <= s.x1 and s.x0 <= 9 <= s.x1
     assert s.y0 <= 3 <= s.y1 and s.y0 <= 7 <= s.y1
+
+
+# ---------- 流式求解 ----------
+
+def _events(result_events):
+    previews = [payload for kind, payload in result_events if kind == "preview"]
+    results = [payload for kind, payload in result_events if kind == "result"]
+    assert len(results) == 1
+    return previews, results[0]
+
+
+def test_stream_preview_lists_all_optimal_paths_and_apply_rule():
+    gray, mask = make_grid(20, 20, fill=100)
+    a, b = (3, 3), (8, 8)
+    set_mask(mask, [a, b])
+    specs = specs_from([{"a": list(a), "b": list(b)}], 20, 20)
+    events = list(stream_repair(specs, mask, gray, 20, 20, [0]))
+    previews, result = _events(events)
+    assert len(previews) == 1
+    assert previews[0]["pair_id"] == 1
+    # 均匀灰度下多条同代价路径 -> 只有一条才判可补，因此为 review
+    assert previews[0]["decision"] == "review"
+    assert previews[0]["path_count"] == len(previews[0]["paths"]) >= 2
+    # 预览路径集合与最终结果的备选集合一致
+    preview_sets = {tuple(tuple(c) for c in p["new_cells"])
+                    for p in previews[0]["paths"]}
+    result_sets = {tuple(tuple(c) for c in alt["new_cells"])
+                   for alt in result.pair_details[0]["alternatives"]}
+    assert preview_sets == result_sets
+
+
+def test_stream_preview_marks_apply_when_path_unique():
+    gray, mask = make_grid(12, 12, fill=200)
+    set_mask(mask, [(2, 5), (6, 5)])
+    specs = specs_from([{"a": [2, 5], "b": [6, 5]}], 12, 12)
+    events = list(stream_repair(specs, mask, gray, 12, 12, [0]))
+    previews, result = _events(events)
+    assert previews[0]["decision"] == "apply"
+    assert previews[0]["path_count"] == 1
+    assert previews[0]["paths"][0]["new_cells"] == [[3, 5], [4, 5], [5, 5]]
+    assert result.decisions == ["apply"]
+
+
+def test_stream_result_matches_plain_solve():
+    gray, mask = make_grid(20, 20, fill=100)
+    a1, b1 = (2, 3), (7, 3)
+    a2, b2 = (2, 4), (7, 8)
+    set_mask(mask, [a1, b1, a2, b2])
+    set_gray(gray, {(x, 3): 10 for x in range(3, 7)})
+    payload = [
+        {"a": list(a1), "b": list(b1), "region": [1, 1, 10, 6]},
+        {"a": list(a2), "b": list(b2), "region": [1, 1, 10, 10]},
+    ]
+    specs = specs_from(payload, 20, 20)
+    plain = solve(specs, mask, gray, 20, 20)
+    _, result = _events(list(stream_repair(specs, mask, gray, 20, 20, [0])))
+    assert result.feasible == plain.feasible
+    assert result.min_total_cost == plain.min_total_cost
+    assert result.decisions == plain.decisions
+    assert sorted(map(tuple, result.applied_cells)) == sorted(
+        map(tuple, plain.applied_cells)
+    )
+    assert result.pair_details == plain.pair_details
+
+
+def test_stream_defers_independent_component_until_after_preview():
+    gray, mask = make_grid(24, 24, fill=100)
+    set_mask(mask, [(2, 3), (8, 3), (2, 15), (8, 15)])
+    payload = [
+        {"a": [2, 3], "b": [8, 3], "region": [1, 1, 10, 6]},
+        {"a": [2, 15], "b": [8, 15], "region": [1, 13, 10, 18]},
+    ]
+    specs = specs_from(payload, 24, 24)
+    trace: list[tuple[str, dict]] = []
+    events = list(
+        stream_repair(specs, mask, gray, 24, 24, [0], trace=lambda p, d: trace.append((p, d)))
+    )
+    previews, result = _events(events)
+    assert len(previews) == 1
+    phases = [p for p, _ in trace]
+    # 两个分量都先做存在性确认，且发生在任何最优求解之前
+    assert phases.count("feasibility_checked") == 2
+    last_check = max(i for i, p in enumerate(phases) if p == "feasibility_checked")
+    first_opt = min(
+        i for i, p in enumerate(phases)
+        if p in ("preview_component_solved", "deferred_component_solved")
+    )
+    assert last_check < first_opt
+    # 预览分量先求，独立分量在预览事件之后才求
+    assert phases.index("preview_component_solved") < phases.index(
+        "deferred_component_solved"
+    )
+    preview_idx = next(i for i, (k, _) in enumerate(events) if k == "preview")
+    deferred = next(d for p, d in trace if p == "deferred_component_solved")
+    assert deferred["members"] == [1]
+    # 事件序列里 preview 在 result 之前，且 result 与普通请求一致
+    assert [k for k, _ in events] == ["preview", "result"]
+    plain = solve(specs, mask, gray, 24, 24)
+    assert result.pair_details == plain.pair_details
+    assert result.min_total_cost == plain.min_total_cost
+    assert result.decisions == ["apply", "apply"]
+
+
+def test_stream_conflicting_component_is_not_deferred():
+    # 两对互相冲突（属于同一分量）：预览对所在分量必须先完整求解；
+    # 分量本身无法同时接通 -> 只发无解结果，不发预览
+    gray, mask = make_grid(10, 10, fill=100)
+    set_mask(mask, [(1, 4), (5, 4), (1, 5), (5, 5)])
+    payload = [
+        {"a": [1, 4], "b": [5, 4], "region": [1, 4, 5, 4]},
+        {"a": [1, 5], "b": [5, 5], "region": [1, 5, 5, 5]},
+    ]
+    specs = specs_from(payload, 10, 10)
+    events = list(stream_repair(specs, mask, gray, 10, 10, [0]))
+    assert [k for k, _ in events] == ["result"]
+    assert not events[0][1].feasible
+
+
+def test_stream_no_solution_sends_only_result():
+    gray, mask = make_grid(10, 10, fill=100)
+    set_mask(mask, [(1, 4), (5, 4), (1, 5), (5, 5)])
+    payload = [
+        {"a": [1, 4], "b": [5, 4], "region": [1, 4, 5, 4]},
+        {"a": [1, 5], "b": [5, 5], "region": [1, 5, 5, 5]},
+    ]
+    specs = specs_from(payload, 10, 10)
+    trace: list[str] = []
+    events = list(
+        stream_repair(specs, mask, gray, 10, 10, [0], trace=lambda p, d: trace.append(p))
+    )
+    previews, result = _events(events)
+    assert previews == []
+    assert not result.feasible
+    assert "冲突" in result.reason
+    assert "preview_component_solved" not in trace
+    assert "deferred_component_solved" not in trace
+
+
+def test_stream_missing_candidate_pair_sends_only_no_solution():
+    # 某对端点被旁线完全包围，区内无合法候选：准备阶段即无解
+    gray, mask = make_grid(16, 16, fill=100)
+    a, b = (2, 2), (5, 5)
+    set_mask(mask, [a, b])
+    # 在 a 四周除 b 方向外全部放原走线 -> a 无可离开的新增像素
+    set_mask(mask, [(1, 2), (3, 2), (2, 1), (2, 3)])
+    specs = specs_from([{"a": list(a), "b": list(b), "region": [0, 0, 7, 7]}], 16, 16)
+    events = list(stream_repair(specs, mask, gray, 16, 16, [0]))
+    assert [k for k, _ in events] == ["result"]
+    assert not events[0][1].feasible
+
+
+def test_stream_multiple_preview_cross_groups_emit_immediately_in_order():
+    # 四个互不冲突的独立组；预览 2 与 4 分属不同分量。
+    # 第 4 对所在分量必须在第 2 对预览发出之后才求最优，且预览顺序按请求。
+    gray, mask = make_grid(40, 40, fill=100)
+    ys = [3, 11, 19, 27]
+    payload = []
+    for y in ys:
+        set_mask(mask, [(2, y), (8, y)])
+        payload.append({"a": [2, y], "b": [8, y], "region": [1, y - 1, 10, y + 1]})
+    specs = specs_from(payload, 40, 40)
+
+    trace: list[tuple[str, dict]] = []
+    events = list(stream_repair(
+        specs, mask, gray, 40, 40, [1, 3],
+        trace=lambda p, d: trace.append((p, d)),
+    ))
+    assert [k for k, _ in events] == ["preview", "preview", "result"]
+    assert [p["pair_id"] for k, p in events if k == "preview"] == [2, 4]
+    assert events[-1][1].decisions == ["apply"] * 4
+    # 第 2 对预览时，第 4 对所在分量还没求解
+    solved = [d["members"] for p, d in trace if p == "preview_component_solved"]
+    assert solved[0] == [1]
+    assert [3] in solved
+    preview_seq = [p for p, _ in trace if p == "preview"]
+    assert len(preview_seq) == 2
+
+
+def test_stream_preview_uses_zero_based_ids_from_solver():
+    # solver 层预览编号为 0 基；API 层负责 1 基转换
+    gray, mask = make_grid(20, 20, fill=100)
+    set_mask(mask, [(2, 3), (8, 3), (2, 15), (8, 15)])
+    payload = [
+        {"a": [2, 3], "b": [8, 3], "region": [1, 1, 10, 6]},
+        {"a": [2, 15], "b": [8, 15], "region": [1, 13, 10, 18]},
+    ]
+    specs = specs_from(payload, 20, 20)
+    events = list(stream_repair(specs, mask, gray, 20, 20, [1]))
+    previews = [p for k, p in events if k == "preview"]
+    assert [p["pair_id"] for p in previews] == [2]
+    assert events[-1][1].decisions == ["apply", "apply"]

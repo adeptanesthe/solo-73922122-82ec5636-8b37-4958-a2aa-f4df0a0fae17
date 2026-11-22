@@ -156,8 +156,41 @@ def fuzz_once(rng: random.Random) -> None:
                 opt_choices[i].add(pair_cands[i][combo[i]][0])
 
     # 求解器结果
-    from app.solver import solve
+    from app.solver import solve, stream_repair
     result = solve(specs, mask, gray, w, h)
+
+    # 流式结果必须与普通请求等价；预览对按随机顺序取
+    preview_ids = [rng.randrange(len(specs))]
+    if len(specs) > 1 and rng.random() < 0.5:
+        extra = rng.randrange(len(specs))
+        if extra not in preview_ids:
+            preview_ids.append(extra)
+    events = list(stream_repair(specs, mask, gray, w, h, preview_ids))
+    stream_result = events[-1][1]
+    assert events[-1][0] == "result"
+    assert stream_result.feasible == result.feasible
+    if result.feasible:
+        assert stream_result.min_total_cost == result.min_total_cost, payload
+        assert stream_result.decisions == result.decisions, payload
+        assert sorted(map(tuple, stream_result.applied_cells)) == sorted(
+            map(tuple, result.applied_cells)
+        ), payload
+        assert stream_result.pair_details == result.pair_details, payload
+    # 有解时预览事件必须与普通结果中该对的判定一致；无解时不得有预览
+    preview_events = [p for k, p in events if k == "preview"]
+    if best is None:
+        assert preview_events == [], payload
+    else:
+        assert [p["pair_id"] - 1 for p in preview_events] == preview_ids
+        for ev in preview_events:
+            detail = next(
+                d for d in result.pair_details if d["pair_id"] == ev["pair_id"]
+            )
+            assert ev["decision"] == detail["decision"], payload
+            n_paths = (len(detail["alternatives"])
+                       if detail["decision"] == "review" else 1)
+            assert ev["path_count"] == n_paths, payload
+            assert ev["decision"] == ("apply" if n_paths == 1 else "review")
 
     if best is None:
         assert not result.feasible, f"暴力无解但求解器报告有解: {payload}"

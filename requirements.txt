@@ -2,3 +2,5 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 pillow==11.1.0
 python-multipart==0.0.20
+# 客户端示例（examples/call_repair*.py）在容器内直接运行所需
+httpx==0.28.1

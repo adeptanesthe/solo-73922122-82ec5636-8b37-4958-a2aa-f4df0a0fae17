@@ -14,6 +14,10 @@
 | 灰度总和最小 | `solve` 中按冲突关系拆连通分量，记忆化 DFS 求全局最低代价 |
 | 只补所有最低代价方案中路径一致的对 | 逐对固定每个候选求条件最优：条件最优等于全局最优的候选集合大小为 1 才 `apply`，否则 `review` |
 | 无法同时接通 | 返回 `status=no_solution`、原因说明与**原掩膜**（逐像素不变） |
+| 先确认全部能接通，再预览指定端点对 | `stream_repair`：先对全部分量做存在性搜索，再按请求顺序发 `preview` |
+| 与预览对无直接/间接冲突的端点组延后求解 | 连通分量即“冲突组”；不含预览对的分量在预览事件发出后才求最优 |
+| 流式结果与普通请求等价 | 两条路径共用 `prepare_repair` / `_supported_candidates` / `_assemble` |
+| 无解只发无解结果与原掩膜 | 流式求解在预览前返回时只产出单个 `result` 事件 |
 
 ### 代价与一致性判定
 
@@ -32,13 +36,15 @@ app/
   solver.py          # 纯函数核心：路径枚举、约束校验、最优化与一致性判定
   main.py            # FastAPI：PNG 校验、请求解析、掩膜写回
 tests/
-  test_solver.py     # 求解器单元测试（18 例）
-  test_api.py        # 接口层测试（10 例，含无解返回原掩膜、各类 400）
+  test_solver.py     # 求解器单元测试（27 例，含流式预览/延后求解）
+  test_api.py        # 接口层测试（20 例，含无解返回原掩膜、各类 400、流式响应）
   test_fuzz.py       # fuzz 对拍暴力穷举（200 例随机网格）
-  fuzz_crosscheck.py # 独立暴力实现
+  fuzz_crosscheck.py # 独立暴力实现 + 流式一致性核对
 examples/
   generate_example.py# 生成演示用灰度图/掩膜/pairs.json
   call_repair.py     # 请求示例，落盘补线掩膜
+  generate_stream_example.py # 生成流式演示数据（含独立端点组）
+  call_repair_stream.py      # 流式请求示例：先预览再落盘整图掩膜
 Dockerfile  docker-compose.yml  requirements*.txt
 ```
 
@@ -99,19 +105,85 @@ python3 examples/call_repair.py
 - 无解：HTTP 200 + `status="no_solution"`，`mask_png_base64` 为**原掩膜**，并带 `reason`。
 - 输入非法：HTTP 400 + 中文错误信息。
 
+## 可选流式响应（先预览指定端点对）
+
+原请求不变，额外两个**可选**表单字段：
+
+| 字段 | 必填 | 说明 |
+| --- | --- | --- |
+| `stream` | 否 | `true` 时返回 NDJSON（`application/x-ndjson`，每行一个 JSON 事件） |
+| `preview_pairs` | `stream=true` 时必填 | 要先看的端点对编号，1 基，与响应中的 `pair_id` 一致；`"2,1"` 或 `"[2,1]"`，顺序即预览顺序 |
+
+事件顺序与语义：
+
+1. **先确认全部端点对能同时接通**（对整个冲突图做一次存在性搜索，不算最优）。
+   任一冲突组无法同时接通 → 只发一条 `result`（`status=no_solution` + 原掩膜），不发预览。
+2. **`preview` 事件**（按请求顺序，可多条）：列出该对在**所有最低总代价方案**中的路径
+   `paths`，`path_count` 为路径数；**只有 1 条**时 `decision="apply"`，否则 `"review"`。
+3. 与预览对**没有直接/间接候选冲突**的端点组（不含预览对的连通分量）在预览发出后才求最优。
+4. **`result` 事件**：与普通请求的响应体完全相同（多一个 `"event": "result"` 字段）。
+
+```json
+{"event":"preview","pair_id":2,"decision":"review","path_count":22,"component_min_cost":4410,"paths":[{"turns":1,"cost":4410,"new_cells":[[38,11],"..."]}]}
+{"event":"result","status":"ok","min_total_cost":5390,"applied_pair_count":2,...}
+```
+
+一条含独立端点组的演示请求（`examples/stream_pairs.json` 的第 3 对与前两对无冲突）：
+
+```bash
+docker compose up --build -d
+# 生成流式演示数据（仓库已附带生成结果，可跳过）
+python3 examples/generate_stream_example.py
+# 预览第 2、1 对；第 3 对（独立组）在预览之后才求最优
+python3 examples/call_repair_stream.py
+```
+
+等价的 `curl`：
+
+```bash
+curl -sN -X POST http://127.0.0.1:8000/repair \
+  -F "image=@examples/stream_gray.png;type=image/png" \
+  -F "mask=@examples/stream_mask.png;type=image/png" \
+  -F "pairs=<examples/stream_pairs.json" \
+  -F "stream=true" -F "preview_pairs=2,1"
+```
+
+不传 `stream`（或 `stream=false`）时，响应与旧版本完全一致（`application/json`）。
+
 ## 本地开发与自测
 
 ```bash
 pip install -r requirements-dev.txt
-python3 -m pytest                 # 29 个测试
-python3 tests/fuzz_crosscheck.py 2000   # 2000 例对拍独立暴力穷举
+python3 -m pytest                 # 48 个测试
+python3 tests/fuzz_crosscheck.py 2000   # 2000 例对拍独立暴力穷举（含流式一致性）
 python3 -m uvicorn app.main:app --port 8000
 ```
 
+## 验证记录
+
+- `pytest`：48 例全过（原 29 例 + 流式求解 9 例 + 流式接口 10 例）。
+- `tests/fuzz_crosscheck.py 2000`：除原有可行性 / 最低代价 / apply-review 判定 /
+  备选集合外，新增核对**流式结果与普通求解逐字段一致**、预览判定与路径数和最终结果一致、
+  无解时无预览事件。
+- 流式预览发出时机：`test_stream_preview_emitted_before_independent_group_solves`
+  惰性消费第一条预览事件，断言此时只对含预览对的分量求过最优，独立分量尚未求解；
+  预览之后再求解独立分量，最终整图结果与普通请求一致。
+- 并列最优：`test_stream_preview_lists_all_optimal_paths_and_apply_rule` /
+  `test_stream_tie_marks_review_and_lists_paths` 核对均匀灰度下多路径同代价 →
+  `decision=review`、列出全部路径；唯一最优 → `apply` 且写入掩膜。
+- 无解：`test_stream_no_solution_sends_only_result_with_original_mask` 核对只发一条
+  `no_solution` 结果且返回掩膜与输入逐像素一致。
+- 实跑：`uvicorn` 启动后 `examples/call_repair_stream.py` 依次收到
+  `preview(pair=2, review, 22 条)`、`preview(pair=1, apply, 1 条)`、`result(ok, cost=5390)`，
+  落盘掩膜与普通请求的 `mask_png_base64` 完全一致。
+
 ## 已知边界 / 未完成项
 
-- 运行环境未安装 Docker，`Dockerfile` 与 `docker-compose.yml` 已通过 YAML/关键字与语法静态核对，
-  但未在本机实际 `docker compose up` 验证；服务本身已用 uvicorn 实跑并通过端到端请求验证。
+- 运行环境未安装 Docker，`Dockerfile` 与 `docker-compose.yml` 只做了静态核对，
+  未在本机 `docker compose up` 实跑；服务本身已用 `uvicorn` 实跑并通过端到端请求验证。
+- 流式的“先发预览”指服务端按事件顺序尽快 flush NDJSON；中间的求解是同步计算，
+  预览事件发出前仍会先把“含预览对的分量”算完，因此预览延迟取决于该分量的规模。
+- 流式响应若在传输途中客户端断开，剩余分量（含独立组）不再计算；这属于预期行为。
 - “最多拐两次”按 Manhattan 三段折线枚举；同行/同列端点在此约束下只有直线路径，
   无法绕行（若直线被挡且区域内无合法路径，该对判无解或待复核，符合规则字面含义）。
 - 内存中以逐行字节数组表示图像，512×512 与 8 对规模下实测求解 < 0.4 秒；
